@@ -1,4 +1,8 @@
+import csv
 import msvcrt
+import types
+
+import pandas as pd
 import time
 import multiprocessing
 import numpy as np
@@ -6,6 +10,7 @@ import time
 import math
 import serial
 import serial.tools.list_ports
+from roboticstoolbox import *
 import array
 import binascii
 import crcmod
@@ -13,6 +18,9 @@ from time import sleep
 import threading
 from binascii import *
 import pandas as pd
+from spatialmath import SE3
+import quaternion
+from spatialmath.base import trotx
 
 ########################################################
 """滑轨部分"""
@@ -20,10 +28,8 @@ import pandas as pd
 
 # 声明串口对象
 ser = serial.Serial()
-
 # 声明位置模式参数
 Location_Success = "01fd026b"
-
 # 回零返回值
 Zero_Success = "019a026b"
 
@@ -42,8 +48,6 @@ def port_open_recv():  # 对串口的参数进行配置
 
 
 # isOpen()函数来查看串口的开闭状态
-
-
 def port_close():
     ser.close()
     if (ser.isOpen()):
@@ -74,8 +78,6 @@ def GetAllSerial():
 
 
 # CCR校验函数
-
-
 # 十进制转十六进制
 def Int2hex(num):
     return hex(int(num, 10))
@@ -152,15 +154,18 @@ def EleMove(Tun, Sep, Acc, Pos, PosEle):
 # 转向： 00 CW 01 CCW
 
 # 读取数据的函数,设定为默认接收位置模式返回的讯息
-def EleRead_Location():
+def EleRead_Location() -> bool:
     data = ser.read(4)  # 读四个字节指令
     data_hex = str(binascii.b2a_hex(data))[2:-1]
     # print(data_hex)
-    if data_hex == Location_Success:
+    f = data_hex == Location_Success
+    if f:
         print("数据发送成功")
+
     else:
         print("数据发送失败")
     ser.flushInput()  # 清除输入缓存区数据
+    return f
 
 
 # 驱动电机转动,输入电机转向，（地址暂时不用），速度和加速度，脉冲数（转动的位置）(转动多少圈)，位置模式 rel 代表相对，abs 代表绝对，返回转动的报文
@@ -194,7 +199,9 @@ def EleMove_Send(Tun, Sep, Acc, Pos, PosEle):
     #  print(SendAdd)
     ser.write(bytes.fromhex(SendAdd))
     # 读取电机返回指令，观察指令是否发送成功
-    EleRead_Location()
+    # while not EleRead_Location():
+    #
+    # sleep(0.01)
 
 
 # 读取数据的函数,设定为默认接收位置模式返回的讯息
@@ -257,9 +264,10 @@ def EleAbsolute_Read():
     else:
         return "-" + Location
 
+
 def do2(Tun, Sep, Acc, Pos, PosEle):
     EleMove_Send(Tun, Sep, Acc, Pos, PosEle)
-    #EleTurnZero()
+    # EleTurnZero()
 
 
 ###################################################################################
@@ -275,7 +283,10 @@ def getch():
 
 from dynamixel_sdk import *
 
-ID = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+ID = [0, 1, 2, 3, 4, 5, 6, 7]
+lengths = [10, 10, 10, 10, 10, 10, 10, 10]
+end_positions_list = []
+rotation_matrices_list = []
 
 ADDR_PRO_TORQUE_ENABLE = 64  # Control table address is different in Dynamixel model
 ADDR_PRO_GOAL_POSITION = 116
@@ -288,8 +299,8 @@ LEN_PRO_GOAL_POSITION = 4
 LEN_PRO_PRESENT_POSITION = 4
 
 PROTOCOL_VERSION = 2.0
-BAUDRATE = 3000000
-DEVICENAME = 'COM4'
+BAUDRATE = 1000000
+DEVICENAME = 'COM3'
 TORQUE_ENABLE = 1
 TORQUE_DISABLE = 0
 DXL_MOVING_STATUS_THRESHOLD = 20
@@ -298,7 +309,7 @@ portHandler = PortHandler(DEVICENAME)
 packetHandler = PacketHandler(PROTOCOL_VERSION)
 groupSyncWrite = GroupSyncWrite(portHandler, packetHandler, ADDR_PRO_GOAL_POSITION, LEN_PRO_GOAL_POSITION)
 groupSyncRead = GroupSyncRead(portHandler, packetHandler, ADDR_PRO_PRESENT_POSITION, LEN_PRO_PRESENT_POSITION)
-groupSyncReadcurrent = GroupSyncRead(portHandler, packetHandler,ADDR_PRO_PRESENT_CURRENT,LEN_PRO_PRESENT_CURRENT)
+groupSyncReadcurrent = GroupSyncRead(portHandler, packetHandler, ADDR_PRO_PRESENT_CURRENT, LEN_PRO_PRESENT_CURRENT)
 groupSyncWritePosition_P = GroupSyncWrite(portHandler, packetHandler, ADDR_PRO_POSITION_P, LEN_PRO_PRESENT_CURRENT)
 
 index = 0
@@ -358,8 +369,8 @@ def do(goal_position):
     dxl_comm_result = groupSyncWrite.txPacket()
     if dxl_comm_result != COMM_SUCCESS:
         print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
-
     groupSyncWrite.clearParam()
+
 
 
 def bye():
@@ -370,7 +381,6 @@ def bye():
             print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
         elif dxl_error != 0:
             print("%s" % packetHandler.getRxPacketError(dxl_error))
-
     portHandler.closePort()
 
 
@@ -385,6 +395,7 @@ def cal_d(pos1, pos2, n):
     return pos
 
 
+# 获取电机位置
 def read_position(ID):
     pre_pos = []
     for i in range(len(ID)):
@@ -393,98 +404,114 @@ def read_position(ID):
         pre_pos.append(dxl_present_position % 4095)
     return pre_pos
 
- # 获取电机电流
+
+# 获取末端旋转矩阵和坐标
+def calculate_end_position(joint_angles1, joint_lengths):
+    def transform_value(x):
+        return x * 90 / 1024
+
+    joint_angles = [transform_value(x) for x in joint_angles1]
+
+    def convert_to_dh_params(joint_angles, joint_lengths):
+        dh_params = []
+        for i in range(len(joint_angles)):
+            alpha = 0
+            a = 0
+            d = joint_lengths[i]
+            theta = joint_angles[i]
+            dh_params.append([alpha, a, d, theta])
+        return np.array(dh_params)
+
+    def dh_rotation_matrix(alpha, a, d, theta):
+        alpha = np.radians(alpha)
+        a = a
+        d = d
+        theta = np.radians(theta)
+
+        rot_alpha = np.array([
+            [1, 0, 0, 0],
+            [0, np.cos(alpha), -np.sin(alpha), 0],
+            [0, np.sin(alpha), np.cos(alpha), 0],
+            [0, 0, 0, 1]
+        ])
+
+        trans_a = np.array([
+            [1, 0, 0, a],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+
+        trans_d = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, d],
+            [0, 0, 0, 1]
+        ])
+
+        rot_theta = np.array([
+            [np.cos(theta), -np.sin(theta), 0, 0],
+            [np.sin(theta), np.cos(theta), 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+
+        return rot_alpha @ trans_a @ trans_d @ rot_theta
+
+    dh_params = convert_to_dh_params(joint_angles, joint_lengths)
+
+    T = np.identity(4)
+
+    for params in dh_params:
+        T = np.dot(T, dh_rotation_matrix(*params))
+
+    end_position = T[:3, 3]
+    rotation_matrix_end = T[:4, :4]
+
+    return end_position, rotation_matrix_end  # end_position：末端坐标  rotation_matrix_end  末端旋转矩阵
+
+
+# 获取电机电流
 def get_currents(ID):
     currents = []
     for i in range(len(ID)):
         dxl_currents, dxl_comm_result, dxl_error = packetHandler.read2ByteTxRx(portHandler, ID[i],
                                                                                ADDR_PRO_PRESENT_CURRENT)
-
         if dxl_currents > 2 ** 15:
             dxl_currents -= 2 ** 16
         currents.append(dxl_currents)
-
     return currents
+
 
 def do3(*sol):
     for i in sol:
+        # process1 = threading.Thread(target=do2, args=("CW", 300, 0, 1, "rel"), daemon=False)
+        # process2 = threading.Thread(target=do, args=[i], daemon=False)
         do(i)
-        time.sleep(0.05)
+        # process1.start()
+        # process2.start()
+        # process1.join()
+        # process2.join()
+        # while process2.is_alive():  # process1.is_alive()
+        #     pass
+        # bujin = EleAbsolute_Read()
+        # angles = read_position(ID)
+        # angles = [(i - 2048) / 4096 * 2 * np.pi for i in angles]
+        # end_position, rotation_matrix_end = calculate_end_position(angles, lengths)
+        # end_positions_list.append(end_position)   #末端坐标
+        # rotation_matrices_list.append(rotation_matrix_end)   #末端旋转矩阵
+        # Tt = snake.fkine(angles)
+        # Tt_.append(Tt)
+        # bujin = EleAbsolute_Read()
+        # print(bujin)
+
+    # 保存为Excel文件
+    # Dd = pd.DataFrame([Tt_],[bujin_])
+    # Dd.to_excel('data.xlsx', index=False)
+    # print(Tt)
 
 
-#####################################################################################################################
-if __name__ == '__main__':
-    check()
-    # CW为正方向
-    GetAllSerial()  # 检查可用串口
-    port_open_recv()  # 打开串口
-
-    pos = read_position(ID)
-
-    # theta_end = [1,2,3,4,5,6,7,8,9,10,11]
-    # theta_ready = [0,0,0,0,0,0,0,0,0,0,0]
-    theta_ready = [2055, 2000, 2048, 2010, 2048, 2010, 2048, 2010, 2048, 2010, 0]
-
-    #theta_end = [2048, 2000, 2048, 2000, 2048, 1800, 2048, 1700, 2048, 1600, 2048]
-
-    theta_end = [2055.00, 2000.00, 2102.65, 1365.33, 2730.67, 2213.20, 	2496.40, 2730.67, 1365.33, 2531.70, 0]
-
-    traj1 = cal_d(pos, theta_ready, 100)
-    for i in range(len(traj1)):
-        do(traj1[i])
-        time.sleep(0.05)
-
-    time.sleep(5)
-
-    EleMove_Send("CW", 100, 0, 4, "rel")
-    time.sleep(5)
-
-    params = []
-    for i in range(5):
-        a = (i + 1) * 2 - 1
-        theta_mid = theta_ready[:-a] + theta_end[2:a+2]
-        params.append(theta_mid)
-
-
-    for i in range(5):
-        if i == 0:
-            sol = cal_d(theta_ready, params[i], 100)
-
-
-            process1 = threading.Thread(target=do2, args=("CW", 200, 0, 20, "rel"))
-            process2 = threading.Thread(target=do3, args=[*sol])
-            process1.start()
-            process2.start()
-            # 等待进程执行完毕
-            process1.join()
-            process2.join()
-
-
-        else:
-            sol = cal_d(sol[-1], params[i], 100)
-
-            process3 = threading.Thread(target=do2, args=("CW", 400, 0, 40, "rel"))
-            process4 = threading.Thread(target=do3, args=[*sol])
-            process3.start()
-            process4.start()
-            # 等待进程执行完毕
-            process3.join()
-            process4.join()
-
-
-
-    sleep(1)
-    ser.close()
-
-
-    time.sleep(1)
-    for i in range(10):
-        position = read_position(ID)
-        print("输出当前位置：",position)
-
-
-
-    def read_excel(file_path):
+def read_excel(file_path):
         # 读取Excel表格数据
         df = pd.read_excel(file_path)
 
@@ -494,25 +521,87 @@ if __name__ == '__main__':
             data_list.append(row.tolist())
 
         return data_list
+pi = np.pi
 
 
+if __name__ == '__main__':
+    theta_ready = [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]
     # 指定Excel文件路径
-    file_path = "C:/Users/Lenovo/Desktop/rectangle.xlsx"
-
+    file_path = "end.xls"
     # 调用函数读取Excel表格数据
-    data = read_excel(file_path)
+    theta_all = read_excel(file_path)
+    theta_end = theta_all[0]
 
 
+    lenof_link = 8
+    a_arm = 0.1
+    pi = np.pi
 
-    sol2 = []
-    for i in range(len(data)):
-        if i != len(data) - 1:
-            sol1 = cal_d(data[i], data[i + 1], 100)
-            sol2 = sol2 + sol1
+    DHs = [RevoluteDH(a=a_arm, alpha=-pi / 2, qlim=[-70 * pi / 180, 70 * pi / 180])]
+    for i in range(1, lenof_link):
+        if i == lenof_link - 1:
+            DHs.append(RevoluteDH(a=a_arm, alpha=0, qlim=[-75 * pi / 180, 75 * pi / 180]))
         else:
-            break
+            DHs.append(RevoluteDH(a=a_arm, alpha=(pi / 2) * (-1) ** (i + 1), qlim=[-75 * pi / 180, 75 * pi / 180]))
+    snake = DHRobot(DHs, name="arm")
+    snake.base = snake.base @ SE3(trotx(np.pi))
 
-    # 打印每行数据
-    for row in sol2:
-        do(row)
-        time.sleep(0.02)
+    theta_test = [(i - 2048) / 4096 * 2 * np.pi for i in theta_end]
+    snake.teach(theta_test)
+    exit()
+    params_mod = []
+    poses = []
+    sol = []
+    angle2 = []
+    file = open('example.csv', 'w', newline='')
+    for i in range(4):
+        a = 2 * (i + 1)
+        theta_mid = theta_ready[:-a] + theta_end[:a]
+        params_mod.append(theta_mid)
+
+    for i in range(4):
+        if i == 0:
+            sol = cal_d(theta_ready, params_mod[i], 50)
+            angles = sol
+
+        else:
+            sol = cal_d(sol[-1], params_mod[i], 50)
+            angles =angles+sol
+
+    p=0
+    for i in angles:
+
+        angle1=[]
+        for ii in i:
+            # print(ii,type(ii))
+            # if type(ii)==type([]):
+            #     print("get list:{}-{}".format(i,ii))
+            #     exit()
+            angle1.append((ii - 2048) / 4096 * 2 * np.pi)
+
+        # print(angle1)
+        # exit()
+        a=snake.fkine(angle1)
+        q = quaternion.from_rotation_matrix(a.R)
+        sol.append(np.array(a))
+        # if type(q)!=quaternion.quaternion:
+        #     print(q)
+        #     exit()
+        writer=csv.writer(file)
+        writer.writerow([q.x,q.y,q.z,q.w,a.t[0]+p,a.t[1],a.t[2]])
+        p+=1
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
